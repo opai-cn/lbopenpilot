@@ -160,7 +160,8 @@ class CarState(CarStateBase):
     self.LOCAL_TIME = True if 1264 in fingerprints[pt_bus] else False
 
     self.cp_bsm = None
-
+    self.time_zone == "UTC"
+    
     self.controls_ready_count = 0
 
   def update(self, can_parsers) -> structs.CarState:
@@ -530,7 +531,6 @@ class CarState(CarStateBase):
       self.adrv_info_160 = cp_cam.vl["ADRV_0x160"] if self.ADRV_0x160 else None
 
       self.hda_info_4a3 = cp.vl["HDA_INFO_4A3"] if self.HDA_INFO_4A3 else None
-      country_code = 0
       if self.hda_info_4a3 is not None:
         speedLimit = self.hda_info_4a3["SPEED_LIMIT"]
         if not self.is_metric:
@@ -539,7 +539,9 @@ class CarState(CarStateBase):
         if int(self.hda_info_4a3["MapSource"]) == 2:
           speed_limit_cam = True
 
-        country_code = int(self.hda_info_4a3["CountryCode"])
+        if self.time_zone == "UTC":
+          country_code = int(self.hda_info_4a3["CountryCode"])
+          self.time_zone = ZoneInfo(NUMERIC_TO_TZ.get(country_code, "UTC"))
 
       self.new_msg_4b4 = cp.vl["NEW_MSG_4B4"] if self.NEW_MSG_4B4 else None
       self.tcs_info_373 = cp.vl["TCS"]
@@ -573,15 +575,14 @@ class CarState(CarStateBase):
     if self.CP.flags & HyundaiFlags.EV:
       ret.cruiseState.nonAdaptive = cp.vl["MANUAL_SPEED_LIMIT_ASSIST"]["MSLA_ENABLED"] == 1
 
-    if self.LOCAL_TIME and country_code > 0:
-      tz = ZoneInfo(NUMERIC_TO_TZ.get(country_code, "UTC"))
+    if self.LOCAL_TIME and self.time_zone != "UTC":
       lt = cp.vl["LOCAL_TIME"]
       y, m, d, H, M, S = int(lt["YEAR"]) + 2000, int(lt["MONTH"]), int(lt["DATE"]), int(lt["HOURS"]), int(lt["MINUTES"]), int(lt["SECONDS"])
       try:
-        dt_local = datetime(y, m, d, H, M, S, tzinfo=tz)
+        dt_local = datetime(y, m, d, H, M, S, tzinfo=self.time_zone)
         ret.datetime = int(dt_local.timestamp() * 1000)
       except:
-        print(f"Error parsing local time: {y}-{m}-{d} {H}:{M}:{S} in {tz}")
+        print(f"Error parsing local time: {y}-{m}-{d} {H}:{M}:{S} in {self.time_zone}")
         pass
 
     prev_cruise_buttons = self.cruise_buttons[-1]
