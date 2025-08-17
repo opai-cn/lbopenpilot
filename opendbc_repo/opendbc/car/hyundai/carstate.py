@@ -576,7 +576,7 @@ class CarState(CarStateBase):
     if self.LOCAL_TIME and country_code > 0:
       tz = ZoneInfo(NUMERIC_TO_TZ.get(country_code, "UTC"))
       lt = cp.vl["LOCAL_TIME"]
-      y, m, d, H, M, S = lt["YEAR"] + 2000, lt["MONTH"], lt["DAY"], lt["HOUR"], lt["MINUTE"], lt["SECOND"]
+      y, m, d, H, M, S = lt["YEAR"] + 2000, lt["MONTH"], lt["DATE"], lt["HOURS"], lt["MINUTES"], lt["SECONDS"]
       dt_local = datetime(y, m, d, H, M, S, tzinfo=tz)
       ret.datetime = int(dt_local.timestamp() * 1000)
 
