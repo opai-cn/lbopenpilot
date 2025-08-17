@@ -517,7 +517,7 @@ class CarState(CarStateBase):
         if not self.is_metric:
           speedLimit *= CV.MPH_TO_KPH
         ret.speedLimit = speedLimit if speedLimit < 255 else 0
-        if int(self.hda_info_4a3["NEW_SIGNAL_4"]) == 17:
+        if int(self.hda_info_4a3["MapSource"]) == 2:
           speed_limit_cam = True
 
       self.new_msg_4b4 = cp.vl["NEW_MSG_4B4"] if self.NEW_MSG_4B4 else None
