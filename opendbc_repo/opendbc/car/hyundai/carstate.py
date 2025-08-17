@@ -13,6 +13,9 @@ from opendbc.car.interfaces import CarStateBase
 
 from openpilot.common.params import Params
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 
 ButtonType = structs.CarState.ButtonEvent.Type
 
@@ -24,6 +27,20 @@ BUTTONS_DICT = {Buttons.RES_ACCEL: ButtonType.accelCruise, Buttons.SET_DECEL: Bu
                 Buttons.GAP_DIST: ButtonType.gapAdjustCruise, Buttons.CANCEL: ButtonType.cancel, Buttons.LFA_BUTTON: ButtonType.lfaButton}
 
 GearShifter = structs.CarState.GearShifter
+
+
+NUMERIC_TO_TZ = {
+    840: "America/New_York",   # 미국 (US) → 동부 시간대
+    124: "America/Toronto",    # 캐나다 (CA) → 동부 시간대
+    250: "Europe/Paris",       # 프랑스 (FR)
+    276: "Europe/Berlin",      # 독일 (DE)
+    826: "Europe/London",      # 영국 (GB)
+    392: "Asia/Tokyo",         # 일본 (JP)
+    156: "Asia/Shanghai",      # 중국 (CN)
+    410: "Asia/Seoul",         # 한국 (KR)
+    036: "Australia/Sydney",   # 호주 (AU)
+    356: "Asia/Kolkata",       # 인도 (IN)
+}
 
 class CarState(CarStateBase):
   def __init__(self, CP):
@@ -140,6 +157,7 @@ class CarState(CarStateBase):
     self.CAM_0x2a4 = True if 0x2a4 in fingerprints[alt_bus] else False
     self.STEER_TOUCH_2AF = True if 0x2af in fingerprints[pt_bus] else False
     self.TPMS = True if 0x3a0 in fingerprints[pt_bus] else False
+    self.LOCAL_TIME = True if 1264 in fingerprints[pt_bus] else False
 
     self.cp_bsm = None
 
@@ -512,6 +530,7 @@ class CarState(CarStateBase):
       self.adrv_info_160 = cp_cam.vl["ADRV_0x160"] if self.ADRV_0x160 else None
 
       self.hda_info_4a3 = cp.vl["HDA_INFO_4A3"] if self.HDA_INFO_4A3 else None
+      country_code = 0
       if self.hda_info_4a3 is not None:
         speedLimit = self.hda_info_4a3["SPEED_LIMIT"]
         if not self.is_metric:
@@ -519,6 +538,8 @@ class CarState(CarStateBase):
         ret.speedLimit = speedLimit if speedLimit < 255 else 0
         if int(self.hda_info_4a3["MapSource"]) == 2:
           speed_limit_cam = True
+
+        country_code = int(self.hda_info_4a3["CountryCode"])
 
       self.new_msg_4b4 = cp.vl["NEW_MSG_4B4"] if self.NEW_MSG_4B4 else None
       self.tcs_info_373 = cp.vl["TCS"]
@@ -551,6 +572,13 @@ class CarState(CarStateBase):
     # TODO: find this message on ICE & HYBRID cars + cruise control signals (if exists)
     if self.CP.flags & HyundaiFlags.EV:
       ret.cruiseState.nonAdaptive = cp.vl["MANUAL_SPEED_LIMIT_ASSIST"]["MSLA_ENABLED"] == 1
+
+    if self.LOCAL_TIME and country_code > 0:
+      tz = ZoneInfo(NUMERIC_TO_TZ.get(country_code, "UTC"))
+      lt = cp.vl["LOCAL_TIME"]
+      y, m, d, H, M, S = lt["YEAR"] + 2000, lt["MONTH"], lt["DAY"], lt["HOUR"], lt["MINUTE"], lt["SECOND"]
+      dt_local = datetime(y, m, d, H, M, S, tzinfo=tz)
+      ret.datetime = int(dt_local.timestamp() * 1000)
 
     prev_cruise_buttons = self.cruise_buttons[-1]
     #self.cruise_buttons.extend(cp.vl_all[self.cruise_btns_msg_canfd]["CRUISE_BUTTONS"])
