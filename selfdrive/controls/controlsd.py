@@ -188,7 +188,7 @@ class Controls:
     return CC, lac_log
 
 
-  def _update_side(self, side: str, leads2, road_edge, hudControl):
+  def _update_side(self, side: str, leads2, road_edge, bsd_state, hudControl):
       def ema(prev, curr, a=0.02):
         return curr if prev is None else prev * (1 - a) + curr * a
 
@@ -204,8 +204,13 @@ class Controls:
       lead_main = leads2[0]
       side_cap = side.capitalize()
 
+      if bsd_state:
+        st["sub"]["dRel"] = ema(st["sub"]["dRel"], 1)
+        st["sub"]["lat"]  = ema(st["sub"]["lat"],  3.2)
+        set_hud(side_cap, "Dist2", st["sub"]["dRel"])
+        set_hud(side_cap, "Lat2",  st["sub"]["lat"])
       # 첫 번째가 10m 이내라면 sub 업데이트 + 두 번째를 main으로
-      if len(leads2) > 1 and lead_main.dRel < 10:
+      elif len(leads2) > 1 and lead_main.dRel < 10:
         st["sub"]["dRel"] = ema(st["sub"]["dRel"], lead_main.dRel)
         st["sub"]["lat"]  = ema(st["sub"]["lat"],  abs(lead_main.dPath))
         set_hud(side_cap, "Dist2", st["sub"]["dRel"])
@@ -281,8 +286,8 @@ class Controls:
     meta = self.sm['modelV2'].meta
     hudControl.modelDesire = 1 if meta.desire == log.Desire.turnLeft else 2 if meta.desire == log.Desire.turnRight else 0
 
-    self._update_side("left",  radarState.leadsLeft2,  meta.distanceToRoadEdgeLeft,  hudControl)
-    self._update_side("right", radarState.leadsRight2, meta.distanceToRoadEdgeRight, hudControl)
+    self._update_side("left",  radarState.leadsLeft2,  meta.distanceToRoadEdgeLeft,  CS.leftBlindspot, hudControl)
+    self._update_side("right", radarState.leadsRight2, meta.distanceToRoadEdgeRight, CS.rightBlindspot, hudControl)
 
     hudControl.rightLaneVisible = True
     hudControl.leftLaneVisible = True
