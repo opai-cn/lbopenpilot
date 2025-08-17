@@ -577,8 +577,12 @@ class CarState(CarStateBase):
       tz = ZoneInfo(NUMERIC_TO_TZ.get(country_code, "UTC"))
       lt = cp.vl["LOCAL_TIME"]
       y, m, d, H, M, S = int(lt["YEAR"]) + 2000, int(lt["MONTH"]), int(lt["DATE"]), int(lt["HOURS"]), int(lt["MINUTES"]), int(lt["SECONDS"])
-      dt_local = datetime(y, m, d, H, M, S, tzinfo=tz)
-      ret.datetime = int(dt_local.timestamp() * 1000)
+      try:
+        dt_local = datetime(y, m, d, H, M, S, tzinfo=tz)
+        ret.datetime = int(dt_local.timestamp() * 1000)
+      except:
+        print(f"Error parsing local time: {y}-{m}-{d} {H}:{M}:{S} in {tz}")
+        pass
 
     prev_cruise_buttons = self.cruise_buttons[-1]
     #self.cruise_buttons.extend(cp.vl_all[self.cruise_btns_msg_canfd]["CRUISE_BUTTONS"])
