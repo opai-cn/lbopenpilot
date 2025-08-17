@@ -38,7 +38,7 @@ NUMERIC_TO_TZ = {
     392: "Asia/Tokyo",         # 일본 (JP)
     156: "Asia/Shanghai",      # 중국 (CN)
     410: "Asia/Seoul",         # 한국 (KR)
-    036: "Australia/Sydney",   # 호주 (AU)
+     36: "Australia/Sydney",   # 호주 (AU)
     356: "Asia/Kolkata",       # 인도 (IN)
 }
 
