@@ -582,7 +582,7 @@ class CarState(CarStateBase):
         dt_local = datetime(y, m, d, H, M, S, tzinfo=self.time_zone)
         ret.datetime = int(dt_local.timestamp() * 1000)
       except:
-        print(f"Error parsing local time: {y}-{m}-{d} {H}:{M}:{S} in {self.time_zone}")
+        #print(f"Error parsing local time: {y}-{m}-{d} {H}:{M}:{S} in {self.time_zone}")
         pass
 
     prev_cruise_buttons = self.cruise_buttons[-1]
