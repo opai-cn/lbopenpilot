@@ -160,7 +160,7 @@ class CarState(CarStateBase):
     self.LOCAL_TIME = True if 1264 in fingerprints[pt_bus] else False
 
     self.cp_bsm = None
-    self.time_zone == "UTC"
+    self.time_zone = "UTC"
     
     self.controls_ready_count = 0
 
