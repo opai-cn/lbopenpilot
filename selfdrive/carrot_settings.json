@@ -1389,7 +1389,7 @@
       "etitle": "RadarTrack Cutin Factor(0)",
       "edescr": "Higher values increase sensitivity to cutting-in or exiting vehicles",
       "min": 0,
-      "max": 500,
+      "max": 1000,
       "default": 0,
       "unit": 10
     },
