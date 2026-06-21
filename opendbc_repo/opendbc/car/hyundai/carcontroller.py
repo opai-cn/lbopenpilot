@@ -65,7 +65,7 @@ def apply_steer_angle_limits_physics(desired_sw_deg: float,
                                      wheelbase_m: float,
                                      steer_ratio: float,
                                      steer_sw_max_deg: float) -> float:
-  max_lat_accel = 5.0   # m/s^2
+  max_lat_accel = 8.5   # m/s^2
   max_lat_jerk  = 4.0   # m/s^3
   max_sw_rate_deg_per_tick = 2.0   # ★ EPS 보호용 상한
 
@@ -140,6 +140,8 @@ class CarController(CarControllerBase):
     self.apply_angle_last = 0
     self.lkas_max_torque = 0
     self.angle_max_torque = 250
+    self.prev_abs_angle_error = 0.0
+    self.recover_level = 1.0
 
     self.lkas11_active = False
 
@@ -238,9 +240,22 @@ class CarController(CarControllerBase):
     if angle_control:
       apply_steer_req = CC.latActive
 
+    def _clip(x, lo, hi):
+      return min(max(x, lo), hi)
+
+    def _scale01(x, lo, hi):
+      return _clip((x - lo) / (hi - lo), 0.0, 1.0)
+
+    angle_error = apply_angle - CS.out.steeringAngleDeg
+    abs_angle_error = abs(angle_error)
+
+    error_delta = self.prev_abs_angle_error - abs_angle_error
+
     if CS.out.steeringPressed:
-      #self.apply_angle_last = CS.out.steeringAngleDeg
+      # Driver touched the wheel, gradually yield.
       self.lkas_max_torque = max(self.lkas_max_torque - 20, 25)
+      self.recover_level = 0.0
+
     else:
       target_torque = self.angle_max_torque
 
@@ -249,11 +264,33 @@ class CarController(CarControllerBase):
       rate_up = self.params.ANGLE_TORQUE_UP_RATE * rate_ratio
       rate_down = self.params.ANGLE_TORQUE_DOWN_RATE * rate_ratio
 
+      recover_level = self.recover_level
+
+      # error_delta > 0 means actual steering angle and apply_angle are getting closer.
+      recover_factor = 0.0
+      if error_delta > 0.02:
+        recover_factor = _scale01(error_delta, 0.02, 0.30)
+
+      # Normal recovery is slow.
+      # If angle error is decreasing, recover faster.
+      recover_rate = 0.005 + recover_factor * 0.035
+      recover_level = _clip(recover_level + recover_rate, 0.0, 1.0)
+      self.recover_level = recover_level
+
+      # While recovering, limit available torque.
+      # recover_level = 0.0 -> 30%
+      # recover_level = 1.0 -> 100%
+      target_torque *= 0.3 + recover_level * 0.7
+
+      # If angle error is already converging, allow torque to come back a little faster.
+      rate_up *= 1.0 + recover_factor * 0.5
+
       if self.lkas_max_torque > target_torque:
         self.lkas_max_torque = max(self.lkas_max_torque - rate_down, target_torque)
       else:
         self.lkas_max_torque = min(self.lkas_max_torque + rate_up, target_torque)
 
+    self.prev_abs_angle_error = abs_angle_error
 
     if not CC.latActive:
       apply_torque = 0
@@ -385,7 +422,7 @@ class CarController(CarControllerBase):
       if self.CP.carFingerprint in CAN_GEARS["send_mdps12"] and CS.mdps12 is not None:  # send mdps12 to LKAS to prevent LKAS error
         can_sends.append(hyundaican.create_mdps12(self.packer, self.frame, CS.mdps12))
 
-      casper_opt = self.CP.carFingerprint in (CAR.HYUNDAI_CASPER_EV)
+      casper_ev = self.CP.carFingerprint == CAR.HYUNDAI_CASPER_EV
       if self.frame % 2 == 0 and self.CP.openpilotLongitudinalControl:
         self.hyundai_jerk.make_jerk(self.CP, CS, accel, actuators, hud_control)
         self.hyundai_jerk.check_carrot_cruise(CC, CS, hud_control, stopping, accel, actuators.aTarget)
@@ -395,7 +432,7 @@ class CarController(CarControllerBase):
           
           can_sends.extend(hyundaican.create_acc_commands_scc(self.packer, CC.enabled, accel, self.hyundai_jerk, int(self.frame / 2),
                                                           hud_control, set_speed_in_units, stopping,
-                                                          CC.cruiseControl.override, casper_opt, CS, self.soft_hold_mode))
+                                                          CC.cruiseControl.override, casper_ev, CS, self.soft_hold_mode))
         else:
           can_sends.extend(hyundaican.create_acc_commands(self.packer, CC.enabled, accel, self.hyundai_jerk, int(self.frame / 2),
                                                 hud_control, set_speed_in_units, stopping,
@@ -410,7 +447,7 @@ class CarController(CarControllerBase):
       if self.frame % 20 == 0 and self.CP.openpilotLongitudinalControl:
         if camera_scc:
           if CS.scc13 is not None:
-            if casper_opt:
+            if casper_ev:
               #can_sends.append(hyundaican.create_acc_opt_copy(CS, self.packer))
               pass
           pass

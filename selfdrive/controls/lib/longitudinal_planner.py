@@ -24,6 +24,7 @@ A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.5
 MIN_ALLOW_THROTTLE_SPEED = 2.5
+RESET_DECEL_RAMP_TIME = 2.0
 
 # Lookup table for turns
 _A_TOTAL_MAX_V = [2.4, 4.8] #[1.7, 3.2]
@@ -108,7 +109,9 @@ class LongitudinalPlanner:
     self.solverExecutionTime = 0.0
 
     self.vCluRatio = 1.0
-
+    self.reset_decel_timer = 0
+    self.reset_decel_start_a = 0.0
+    
     self.v_cruise_kph = 0.0
 
     self.params = Params()
@@ -183,7 +186,23 @@ class LongitudinalPlanner:
       self.a_desired = np.clip(sm['carState'].aEgo, accel_limits[0], accel_limits[1])
       
       self.mpc.prev_a = np.full(N+1, self.a_desired) ## carrot
-      accel_limits_turns[0] = accel_limits_turns[0] = 0.0 ## carrot
+
+      self.reset_decel_timer = int(RESET_DECEL_RAMP_TIME / self.dt)
+      self.reset_decel_start_a = self.a_desired
+
+    elif self.reset_decel_timer > 0:
+      ramp_steps = max(1, int(RESET_DECEL_RAMP_TIME / self.dt))
+      t = float(np.clip(self.reset_decel_timer / ramp_steps, 0.0, 1.0))
+      self.reset_decel_timer -= 1
+
+      # 2초 동안 감속 하한을 현재 가속도 근처에서 원래 limit으로 천천히 복귀
+      soft_min_accel = min(0.0, self.reset_decel_start_a - 0.05)
+      ramped_min_accel = soft_min_accel * t + accel_limits_turns[0] * (1.0 - t)
+
+      accel_limits_turns[0] = max(
+        accel_limits_turns[0],
+        min(0.0, ramped_min_accel)
+      )
 
     # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))

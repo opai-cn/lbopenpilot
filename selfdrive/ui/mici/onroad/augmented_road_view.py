@@ -20,6 +20,8 @@ from openpilot.common.transformations.orientation import rot_from_euler
 from enum import IntEnum
 
 from openpilot.selfdrive.ui.mici.onroad.traffic_light import TrafficLight
+import math
+from openpilot.common.params import Params
 
 OpState = log.SelfdriveState.OpenpilotState
 CALIBRATED = log.LiveCalibrationData.Status.calibrated
@@ -37,6 +39,8 @@ WIDE_CAM_MAX_SPEED = 5.0  # m/s (10 mph)
 ROAD_CAM_MIN_SPEED = 10  # m/s (25 mph)
 
 CAM_Y_OFFSET = 20
+ROAD_VIEW_HIDE_DELAY = 10.0
+ROAD_VIEW_HIDE_TOLERANCE = 3.0
 
 
 class BookmarkIcon(Widget):
@@ -138,6 +142,9 @@ class AugmentedRoadView(CameraView):
     self._bookmark_callback = bookmark_callback
     self._set_placeholder_color(rl.BLACK)
 
+    self.params = Params()
+    self._last_device_position = ""
+
     self.device_camera: DeviceCameraConfig | None = None
     self.view_from_calib = view_frame_from_device_frame.copy()
     self.view_from_wide_calib = view_frame_from_device_frame.copy()
@@ -179,6 +186,8 @@ class AugmentedRoadView(CameraView):
     # update offroad label
     if ui_state.panda_type == log.PandaState.PandaType.unknown:
       self._offroad_label.set_text("system booting")
+    elif ui_state.ignition and not ui_state.started:
+      self._offroad_label.set_text("openpilot can't start\ncheck alerts")
     else:
       self._offroad_label.set_text("start the car to\nuse openpilot")
 
@@ -211,11 +220,16 @@ class AugmentedRoadView(CameraView):
       int(self._content_rect.height)
     )
 
-    # Render the base camera view
-    super()._render(self._content_rect)
+    road_view_mode = self._road_view_mode()
+    if road_view_mode in (2, 3):
+      rl.draw_rectangle_rec(self._content_rect, rl.BLACK)
+    else:
+      # Render the base camera view
+      super()._render(self._content_rect)
 
-    # Draw all UI overlays
-    self._model_renderer.render(self._content_rect)
+    if road_view_mode in (0, 2):
+      # Draw all UI overlays
+      self._model_renderer.render(self._content_rect)
 
     # Fade out bottom of overlays for looks
     rl.draw_texture_ex(self._fade_texture, rl.Vector2(self._content_rect.x, self._content_rect.y), 0.0, 1.0, rl.WHITE)
@@ -260,11 +274,27 @@ class AugmentedRoadView(CameraView):
       x = int(self._content_rect.x + 16)
       y = int(self._content_rect.y + self._content_rect.height - 16)
       rl.draw_circle(x, y, 6, rl.Color(255, 0, 0, 220))
-      
+
     # publish uiDebug
     msg = messaging.new_message('uiDebug')
     msg.uiDebug.drawTimeMillis = (time.monotonic() - start_draw) * 1000
     self._pm.send('uiDebug', msg)
+
+  def _road_view_mode(self):
+    mode = ui_state.show_model_view
+    if mode <= 0:
+      return 0
+
+    ratio = ui_state.show_brightness_ratio
+    if not ui_state.started or ratio <= 0.0 or ratio >= 1.0:
+      return 0
+
+    if time.monotonic() - ui_state.started_time < ROAD_VIEW_HIDE_DELAY:
+      return 0
+
+    target_brightness = ratio * 100.0
+    current_brightness = ui_state.sm['deviceState'].screenBrightnessPercent
+    return min(mode, 3) if current_brightness <= target_brightness + ROAD_VIEW_HIDE_TOLERANCE else 0
 
   def _switch_stream_if_needed(self, sm):
     if sm['selfdriveState'].experimentalMode and WIDE_CAM in self.available_streams:
@@ -295,6 +325,17 @@ class AugmentedRoadView(CameraView):
     calib = sm['liveCalibration']
     if len(calib.rpyCalib) != 3 or calib.calStatus != CALIBRATED:
       return
+
+    # ---------------------------------------------------------
+    pitch = math.degrees(calib.rpyCalib[1])
+    yaw = math.degrees(calib.rpyCalib[2])
+
+    position = f"{abs(pitch):.1f}° {'v' if pitch > 0 else '^'} {abs(yaw):.1f}° {'<' if yaw > 0 else '>'}"
+
+    if position != self._last_device_position:
+      self.params.put("DevicePosition", position)
+      self._last_device_position = position
+    # ---------------------------------------------------------
 
     # Update view_from_calib matrix
     device_from_calib = rot_from_euler(calib.rpyCalib)

@@ -1,10 +1,12 @@
 import json
 import time
+import numpy as np
 import pyray as rl
 from dataclasses import dataclass
 from typing import Optional
 from openpilot.common.constants import CV
-from openpilot.selfdrive.ui.mici.onroad.torque_bar import TorqueBar
+# from openpilot.selfdrive.ui.mici.onroad.torque_bar import TorqueBar # 아이콘에 토크 적용: 토크바 미사용
+from openpilot.selfdrive.ui.mici.onroad import blend_colors
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
@@ -15,6 +17,7 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from cereal import log
 from openpilot.common.params import Params
 from datetime import datetime
+from opendbc.car import ACCELERATION_DUE_TO_GRAVITY
 
 EventName = log.OnroadEvent.EventName
 
@@ -24,6 +27,7 @@ KM_TO_MILE = 0.621371
 CRUISE_DISABLED_CHAR = '–'
 
 SET_SPEED_PERSISTENCE = 2.5  # seconds
+DEFAULT_MAX_LAT_ACCEL = 3.0  # m/s^2
 
 @dataclass(frozen=True)
 class SetSpeedOverrideState:
@@ -180,7 +184,8 @@ class HudRenderer(Widget):
     self._font_display: rl.Font = gui_app.font(FontWeight.DISPLAY)
 
     self._turn_intent = TurnIntent()
-    self._torque_bar = TorqueBar()
+    # self._torque_bar = TorqueBar() # 아이콘에 토크 적용: 토크바 미사용
+    self._torque_filter = FirstOrderFilter(0, 0.1, 1 / gui_app.target_fps) # 아이콘에 토크 적용: LowPassFilter
 
     # 휠 당근 휠로 변경
     self._txt_wheel: rl.Texture = gui_app.texture('icons_mici/carrot_wheel.png', 50, 50) # 당근 휠
@@ -243,10 +248,30 @@ class HudRenderer(Widget):
     speed_conversion = CV.MS_TO_KPH if ui_state.is_metric else CV.MS_TO_MPH
     self.speed = max(0.0, v_ego * speed_conversion)
 
+    # 토크 상태 계산 (휠 아이콘 크기 조절용) from TorqueBar()
+    if controls_state.lateralControlState.which() == 'angleState':
+      live_parameters = sm['liveParameters']
+      car_control = sm['carControl']
+
+      actual_lateral_accel = controls_state.curvature * car_state.vEgo ** 2
+      desired_lateral_accel = controls_state.desiredCurvature * car_state.vEgo ** 2
+      accel_diff = (desired_lateral_accel - actual_lateral_accel)
+
+      roll_compensation = live_parameters.roll * ACCELERATION_DUE_TO_GRAVITY * np.interp(car_state.vEgo, [5, 15], [0.0, 1.0])
+      lateral_acceleration = actual_lateral_accel - roll_compensation
+      max_lateral_acceleration = ui_state.CP.maxLateralAccel if ui_state.CP else DEFAULT_MAX_LAT_ACCEL
+
+      if car_control.latActive:
+        self._torque_filter.update(float(np.clip((lateral_acceleration + accel_diff) / max_lateral_acceleration, -1.0, 1.0)))
+      else:
+        self._torque_filter.update(0.0)
+    else:
+      self._torque_filter.update(float(-sm['carOutput'].actuatorsOutput.torque))
+
   def _render(self, rect: rl.Rectangle) -> None:
     """Render HUD elements to the screen."""
 
-    self._torque_bar.render(rect)
+    # self._torque_bar.render(rect) # 아이콘에 토크 적용: 토크바 미사용
 
     # bottom-left panel (speed_bg)
     self._draw_set_speed(rect)
@@ -273,20 +298,30 @@ class HudRenderer(Widget):
   def _draw_steering_wheel_icon(self, wheel_txt, pos_x: int, pos_y: int) -> None:
     rotation = -ui_state.sm['carState'].steeringAngleDeg
 
-    turn_intent_margin = 25
+    torque_val = abs(self._torque_filter.x)
+    # 토크가 0.5 넘어가면 휠 아이콘을 서서히 1.5배까지 키우기
+    scale = float(np.interp(torque_val, [0.5, 1.0], [1.0, 1.5]))
+    scaled_width = wheel_txt.width * scale
+    scaled_height = wheel_txt.height * scale
+
+    turn_intent_margin = 25 * scale
     self._turn_intent.render(rl.Rectangle(
-      pos_x - wheel_txt.width / 2 - turn_intent_margin,
-      pos_y - wheel_txt.height / 2 - turn_intent_margin,
-      wheel_txt.width + turn_intent_margin * 2,
-      wheel_txt.height + turn_intent_margin * 2,
+      pos_x - scaled_width / 2 - turn_intent_margin,
+      pos_y - scaled_height / 2 - turn_intent_margin,
+      scaled_width + turn_intent_margin * 2,
+      scaled_height + turn_intent_margin * 2,
     ))
 
     src_rect = rl.Rectangle(0, 0, wheel_txt.width, wheel_txt.height)
-    dest_rect = rl.Rectangle(pos_x, pos_y, wheel_txt.width, wheel_txt.height)
-    origin = (wheel_txt.width / 2, wheel_txt.height / 2)
+    dest_rect = rl.Rectangle(pos_x, pos_y, scaled_width, scaled_height)
+    origin = (scaled_width / 2, scaled_height / 2)
 
     if ui_state.lat_active:
-      wheel_color = rl.Color(0, 255, 0, int(self._wheel_alpha_filter.x))
+      # 토크 정도에 따라 녹색 -> 주황색 블렌딩
+      green_color = rl.Color(0, 255, 0, int(self._wheel_alpha_filter.x))
+      orange_color = rl.Color(255, 115, 0, int(self._wheel_alpha_filter.x))
+      blend_factor = float(np.clip((torque_val - 0.75) * 4.0, 0.0, 1.0))
+      wheel_color = blend_colors(green_color, orange_color, blend_factor)
     else:
       wheel_color = rl.Color(230, 230, 230, int(self._wheel_alpha_filter.x))
 
@@ -349,52 +384,91 @@ class HudRenderer(Widget):
     time_block_right = time_x
 
     if show_date_time != 0:
-      time_text = now.strftime("%H:%M:%S")
-      date_text = now.strftime("%y-%m-%d")
+      weekdays_ko = ["일", "월", "화", "수", "목", "금", "토"]
+      # Python weekday(): 월=0 ... 일=6 이라서 C tm_wday 스타일로 변환
+      weekday = weekdays_ko[(now.weekday() + 1) % 7]
+
+      time_text = now.strftime("%H:%M")
+      date_text = now.strftime(f"%m-%d({weekday})")
 
       if show_date_time == 1:
-        # two lines: both use smaller font
-        dt_font = small_dt_font
+        # 시간 + 날짜: 시간은 조금 크게, 날짜는 조금 작게
+        time_font = int(wheel_txt.height * 1.05)
+        date_font = max(18, int(time_font * 0.58))
 
-        date_size = measure_text_cached(self._font_medium, date_text, dt_font)
-        time_size = measure_text_cached(self._font_semi_bold, time_text, dt_font)
+        time_size = measure_text_cached(self._font_display, time_text, time_font)
+        date_size = measure_text_cached(self._font_display, date_text, date_font)
 
-        line_gap = max(2, int(dt_font * 0.10))
-        total_h = date_size.y + line_gap + time_size.y
+        line_gap = max(2, int(time_font * 0.02))
+        total_h = time_size.y + line_gap + date_size.y
         base_y = pos_y - total_h / 2
 
-        date_y = base_y
-        time_y = date_y + date_size.y + line_gap
+        block_w = max(time_size.x, date_size.x)
 
-        block_w = max(date_size.x, time_size.x)
-        date_x = time_x + (block_w - date_size.x) / 2
         draw_time_x = time_x + (block_w - time_size.x) / 2
+        date_x = time_x + (block_w - date_size.x) / 2
 
-        draw_text_ui_style(date_text, date_x, date_y, dt_font, rl.Color(255, 255, 255, 220), font=self._font_display, border_width=1.0, shadow_offset=8.0, align="left_top", y_offset=0.0)
+        time_y = base_y
+        date_y = time_y + time_size.y + line_gap
 
-        draw_text_ui_style(time_text, draw_time_x, time_y, dt_font, rl.Color(255, 255, 255, 230), font=self._font_display, border_width=1.0, shadow_offset=8.0, align="left_top", y_offset=0.0)
+        draw_text_ui_style(
+          time_text, draw_time_x, time_y, time_font,
+          rl.Color(255, 255, 255, 235),
+          font=self._font_display,
+          border_width=1.0,
+          shadow_offset=3.0,
+          align="left_top",
+          y_offset=0.0,
+        )
+
+        draw_text_ui_style(
+          date_text, date_x, date_y, date_font,
+          rl.Color(255, 255, 255, 220),
+          font=self._font_display,
+          border_width=1.0,
+          shadow_offset=3.0,
+          align="left_top",
+          y_offset=0.0,
+        )
 
         time_block_right = time_x + block_w
 
       elif show_date_time == 2:
-        # time only: large font
-        text_font = time_font
-        time_size = measure_text_cached(self._font_semi_bold, time_text, text_font)
+        # 시간만: 크게
+        text_font = int(wheel_txt.height * 1.1)
+        time_size = measure_text_cached(self._font_display, time_text, text_font)
         time_y = pos_y - time_size.y / 2
 
-        draw_text_ui_style(time_text, time_x, time_y, text_font, rl.Color(255, 255, 255, 230), font=self._font_display, border_width=1.0, shadow_offset=8.0, align="left_top", y_offset=0.0)
+        draw_text_ui_style(
+          time_text, time_x, time_y, text_font,
+          rl.Color(255, 255, 255, 235),
+          font=self._font_display,
+          border_width=1.0,
+          shadow_offset=3.0,
+          align="left_top",
+          y_offset=0.0,
+        )
 
         time_block_right = time_x + time_size.x
 
       elif show_date_time == 3:
-        # date only: also large font
-        text_font = time_font
-        date_size = measure_text_cached(self._font_medium, date_text, text_font)
+        # 날짜만: 년도 없이 요일 포함
+        text_font = int(wheel_txt.height * 0.72)
+        date_size = measure_text_cached(self._font_display, date_text, text_font)
         date_y = pos_y - date_size.y / 2
 
-        draw_text_ui_style(date_text, time_x, date_y, text_font, rl.Color(255, 255, 255, 220), font=self._font_display, border_width=1.0, shadow_offset=8.0, align="left_top", y_offset=0.0)
+        draw_text_ui_style(
+          date_text, time_x, date_y, text_font,
+          rl.Color(255, 255, 255, 220),
+          font=self._font_display,
+          border_width=1.0,
+          shadow_offset=3.0,
+          align="left_top",
+          y_offset=0.0,
+        )
 
         time_block_right = time_x + date_size.x
+
 
     # --------------------------------------------------------------------------
     # Traffic Light (always higher priority than debug UI)
