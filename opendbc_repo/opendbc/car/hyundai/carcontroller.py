@@ -64,10 +64,16 @@ def apply_steer_angle_limits_physics(desired_sw_deg: float,
                                      lat_active: bool,
                                      wheelbase_m: float,
                                      steer_ratio: float,
-                                     steer_sw_max_deg: float) -> float:
+                                     steer_sw_max_deg: float,
+                                     model_v2=None) -> float:
   max_lat_accel = 8.5   # m/s^2
   max_lat_jerk  = 4.0   # m/s^3
-  max_sw_rate_deg_per_tick = 2.0   # ★ EPS 보호용 상한
+  y_std_1s = 0.1
+  if model_v2 is not None and len(model_v2.position.yStd) > 10:
+    model_y_std_1s = float(model_v2.position.yStd[10])
+    if np.isfinite(model_y_std_1s) and model_y_std_1s >= 0.0:
+      y_std_1s = model_y_std_1s
+  max_sw_rate_deg_per_tick = float(np.interp(y_std_1s, [0.1, 0.2, 0.4], [2.0, 1.5, 0.8]))
 
   v = max(float(v_ego), 1.0)
 
@@ -86,14 +92,15 @@ def apply_steer_angle_limits_physics(desired_sw_deg: float,
   max_drw_per_tick = max_drw_dt * DT_CTRL                        # rad/tick
   max_drw_per_tick_deg = float(np.degrees(max_drw_per_tick))
 
+  err = abs(target_sw - last_sw_deg)
+  if err > 20.0:
+    max_sw_rate_deg_per_tick = min(max_sw_rate_deg_per_tick, 1.0)
+
   max_drw_per_tick_deg = min(
     max_drw_per_tick_deg,
     max_sw_rate_deg_per_tick / steer_ratio
   )
-  err = abs(target_sw - last_sw_deg)
-  if err > 20.0:
-    max_drw_per_tick_deg *= 0.5
-  
+
   # --- rate limit ---
   cmd_rw = rate_limit(target_rw, last_rw, -max_drw_per_tick_deg, max_drw_per_tick_deg)
 
@@ -140,8 +147,12 @@ class CarController(CarControllerBase):
     self.apply_angle_last = 0
     self.lkas_max_torque = 0
     self.angle_max_torque = 250
-    self.prev_abs_angle_error = 0.0
-    self.recover_level = 1.0
+    self.steering_pressed_prev = False
+    self.recovering_from_override = False
+    self.full_recovery_frames = 0
+    self.repeated_override_count = 0
+    self.override_latched = False
+    self.override_release_frames = 0
 
     self.lkas11_active = False
 
@@ -233,68 +244,85 @@ class CarController(CarControllerBase):
       CC.latActive,
       self.CP.wheelbase,
       self.CP.steerRatio,
-      self.params.ANGLE_LIMITS.STEER_ANGLE_MAX
+      self.params.ANGLE_LIMITS.STEER_ANGLE_MAX,
+      CS.modelV2,
     )
 
     
     if angle_control:
       apply_steer_req = CC.latActive
 
-    def _clip(x, lo, hi):
-      return min(max(x, lo), hi)
+    steering_pressed_rising = CS.out.steeringPressed and not self.steering_pressed_prev
+    if steering_pressed_rising:
+      if 0 < self.full_recovery_frames < int(5.0 / DT_CTRL):
+        self.repeated_override_count = min(self.repeated_override_count + 1, 3)
+      self.full_recovery_frames = 0
+      self.recovering_from_override = True
 
-    def _scale01(x, lo, hi):
-      return _clip((x - lo) / (hi - lo), 0.0, 1.0)
-
-    angle_error = apply_angle - CS.out.steeringAngleDeg
-    abs_angle_error = abs(angle_error)
-
-    error_delta = self.prev_abs_angle_error - abs_angle_error
+    torque_ratio = abs(CS.out.steeringTorque) / max(self.params.STEER_THRESHOLD, 1.0)
+    recovery_allowed = False
 
     if CS.out.steeringPressed:
-      # Driver touched the wheel, gradually yield.
-      self.lkas_max_torque = max(self.lkas_max_torque - 20, 25)
-      self.recover_level = 0.0
-
-    else:
-      target_torque = self.angle_max_torque
-
-      max_steering_tq = self.params.STEER_DRIVER_ALLOWANCE * 0.7
-      rate_ratio = max(20, max_steering_tq - abs(CS.out.steeringTorque)) / max_steering_tq
-      rate_up = self.params.ANGLE_TORQUE_UP_RATE * rate_ratio
-      rate_down = self.params.ANGLE_TORQUE_DOWN_RATE * rate_ratio
-
-      recover_level = self.recover_level
-
-      # error_delta > 0 means actual steering angle and apply_angle are getting closer.
-      recover_factor = 0.0
-      if error_delta > 0.02:
-        recover_factor = _scale01(error_delta, 0.02, 0.30)
-
-      # Normal recovery is slow.
-      # If angle error is decreasing, recover faster.
-      recover_rate = 0.005 + recover_factor * 0.035
-      recover_level = _clip(recover_level + recover_rate, 0.0, 1.0)
-      self.recover_level = recover_level
-
-      # While recovering, limit available torque.
-      # recover_level = 0.0 -> 30%
-      # recover_level = 1.0 -> 100%
-      target_torque *= 0.3 + recover_level * 0.7
-
-      # If angle error is already converging, allow torque to come back a little faster.
-      rate_up *= 1.0 + recover_factor * 0.5
-
-      if self.lkas_max_torque > target_torque:
-        self.lkas_max_torque = max(self.lkas_max_torque - rate_down, target_torque)
+      # Start yielding immediately when driver override is confirmed.
+      self.override_latched = True
+      self.override_release_frames = 0
+      torque_delta = -20.0
+    elif self.lkas_max_torque >= self.angle_max_torque:
+      # Once fully recovered, hold full authority until the next driver override.
+      torque_delta = 0.0
+    elif self.override_latched:
+      # Hold reduced authority until driver torque stays below 60% for 0.2 seconds.
+      self.override_release_frames = self.override_release_frames + 1 if torque_ratio < 0.6 else 0
+      if self.override_release_frames >= int(0.2 / DT_CTRL):
+        self.override_latched = False
+        self.override_release_frames = 0
+        recovery_allowed = True
       else:
-        self.lkas_max_torque = min(self.lkas_max_torque + rate_up, target_torque)
+        torque_delta = 0.0
+    else:
+      recovery_allowed = True
 
-    self.prev_abs_angle_error = abs_angle_error
+    if recovery_allowed:
+      # Use one-second model uncertainty to set the base torque recovery time.
+      # Missing or invalid model data falls back to a moderate 1.5-second recovery.
+      y_std_1s = 0.2
+      if CS.modelV2 is not None and len(CS.modelV2.position.yStd) > 10:
+        model_y_std_1s = float(CS.modelV2.position.yStd[10])
+        if np.isfinite(model_y_std_1s) and model_y_std_1s >= 0.0:
+          y_std_1s = model_y_std_1s
+
+      recovery_time = float(np.interp(y_std_1s, [0.1, 0.2, 0.4], [0.1, 1.5, 3.0]))
+      recovery_time = max(recovery_time, float(np.interp(
+        self.repeated_override_count,
+        [0, 1, 2, 3],
+        [0.1, 1.0, 2.0, 3.0],
+      )))
+      base_rate_up = (self.angle_max_torque - self.params.ANGLE_MIN_TORQUE) * DT_CTRL / recovery_time
+
+      # During recovery, taper the rate to zero. Only steeringPressed can reduce authority.
+      torque_delta = base_rate_up * float(np.interp(torque_ratio, [0.6, 0.8], [1.0, 0.0]))
+    self.lkas_max_torque = float(np.clip(self.lkas_max_torque + torque_delta,
+                                         self.params.ANGLE_MIN_TORQUE, self.angle_max_torque))
+
+    if not CS.out.steeringPressed and self.recovering_from_override and self.lkas_max_torque >= self.angle_max_torque:
+      self.recovering_from_override = False
+      self.full_recovery_frames = 1
+    elif not CS.out.steeringPressed and self.full_recovery_frames > 0:
+      self.full_recovery_frames += 1
+      if self.full_recovery_frames >= int(5.0 / DT_CTRL):
+        self.full_recovery_frames = 0
+        self.repeated_override_count = 0
 
     if not CC.latActive:
       apply_torque = 0
       self.lkas_max_torque = 0
+      self.recovering_from_override = False
+      self.full_recovery_frames = 0
+      self.repeated_override_count = 0
+      self.override_latched = False
+      self.override_release_frames = 0
+
+    self.steering_pressed_prev = CS.out.steeringPressed if CC.latActive else False
 
     self.apply_angle_last = apply_angle
 

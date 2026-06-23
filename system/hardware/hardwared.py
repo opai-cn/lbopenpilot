@@ -10,7 +10,7 @@ from collections import OrderedDict, namedtuple
 import psutil
 
 import cereal.messaging as messaging
-from cereal import log
+from cereal import car, log
 from cereal.services import SERVICE_LIST
 from openpilot.common.utils import strip_deprecated_keys
 from openpilot.common.filter_simple import FirstOrderFilter
@@ -102,9 +102,6 @@ def hw_state_thread(end_event, hw_queue):
   prev_hw_state = None
 
   modem_version = None
-  modem_configured = False
-  modem_missing_count = 0
-  modem_restart_count = 0
 
   while not end_event.is_set():
     # these are expensive calls. update every 10s
@@ -122,18 +119,6 @@ def hw_state_thread(end_event, hw_queue):
           if modem_version is not None:
             cloudlog.event("modem version", version=modem_version)
 
-        if AGNOS and modem_restart_count < 3 and HARDWARE.get_modem_version() is None:
-          # TODO: we may be able to remove this with a MM update
-          # ModemManager's probing on startup can fail
-          # rarely, restart the service to probe again.
-          # Also, AT commands sometimes timeout resulting in ModemManager not
-          # trying to use this modem anymore.
-          modem_missing_count += 1
-          if (modem_missing_count % 4) == 0:
-            modem_restart_count += 1
-            cloudlog.event("restarting ModemManager")
-            os.system("sudo systemctl restart --no-block ModemManager")
-
         tx, rx = HARDWARE.get_modem_data_usage()
 
         hw_state = HardwareState(
@@ -150,17 +135,37 @@ def hw_state_thread(end_event, hw_queue):
         except queue.Full:
           pass
 
-        if not modem_configured and HARDWARE.get_modem_version() is not None:
-          cloudlog.warning("configuring modem")
-          HARDWARE.configure_modem()
-          modem_configured = True
-
         prev_hw_state = hw_state
       except Exception:
         cloudlog.exception("Error getting hardware state")
 
     count += 1
     time.sleep(DT_HW)
+
+
+class _CarParamsCache:
+  def __init__(self, refresh_s: float = 5.0):
+    self._refresh_s = refresh_s
+    self._last_check = 0.0
+    self._last_bytes: bytes | None = None
+    self.is_tesla = False
+
+  def update(self, params: Params) -> None:
+    now = time.monotonic()
+    if (now - self._last_check) < self._refresh_s:
+      return
+    self._last_check = now
+
+    cp_bytes = params.get("CarParams")
+    if not cp_bytes or cp_bytes == self._last_bytes:
+      return
+    self._last_bytes = cp_bytes
+
+    try:
+      CP = messaging.log_from_bytes(cp_bytes, car.CarParams)
+      self.is_tesla = CP.brand == "tesla"
+    except Exception:
+      self.is_tesla = False
 
 
 def hardware_thread(end_event, hw_queue) -> None:
@@ -201,6 +206,7 @@ def hardware_thread(end_event, hw_queue) -> None:
   offroad_cycle_count = 0
 
   params = Params()
+  cp_cache = _CarParamsCache()
   power_monitor = PowerMonitoring()
 
   uptime_offroad: float = params.get("UptimeOffroad", return_default=True)
@@ -350,7 +356,11 @@ def hardware_thread(end_event, hw_queue) -> None:
       except Exception:
         pass
 
-    should_pwrsave = not onroad_conditions["ignition"] and msg.deviceState.screenBrightnessPercent < 1e-3
+    # Tesla vehicles can keep CAN powered while parked, so keep the device awake.
+    cp_cache.update(params)
+    tesla_no_sleep = cp_cache.is_tesla
+
+    should_pwrsave = (not tesla_no_sleep) and not onroad_conditions["ignition"] and msg.deviceState.screenBrightnessPercent < 1e-3
     if should_pwrsave != pwrsave or (count == 0):
       HARDWARE.set_power_save(should_pwrsave)
     pwrsave = should_pwrsave
@@ -375,6 +385,10 @@ def hardware_thread(end_event, hw_queue) -> None:
       if off_ts is None:
         off_ts = time.monotonic()
 
+    # Keep onroad processes alive on Tesla even when parked.
+    if tesla_no_sleep and started_ts is None and started_seen:
+      started_ts = time.monotonic()
+
     # Offroad power monitoring
     voltage = None if peripheralState.pandaType == log.PandaState.PandaType.unknown else peripheralState.voltage
     power_monitor.calculate(voltage, onroad_conditions["ignition"])
@@ -389,7 +403,7 @@ def hardware_thread(end_event, hw_queue) -> None:
     msg.deviceState.somPowerDrawW = som_power_draw
 
     # Check if we need to shut down
-    if power_monitor.should_shutdown(onroad_conditions["ignition"], in_car, off_ts, started_seen):
+    if (not tesla_no_sleep) and power_monitor.should_shutdown(onroad_conditions["ignition"], in_car, off_ts, started_seen):
       cloudlog.warning(f"shutting device down, offroad since {off_ts}")
       params.put_bool("DoShutdown", True)
 
